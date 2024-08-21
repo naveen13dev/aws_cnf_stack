@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack to create a VPC, public subnet, EC2 instance (named 'docker'), install Docker and AWS CLI, and push Docker image to ECR
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+  ECRRepositoryUrl:
+    Description: The URL of the ECR repository where the Docker image will be pushed
+    Type: String
+
+  ImageTag:
+    Description: The tag to use for the Docker image
+    Type: String
+    Default: latest
+
+Resources:
+  # Create a new VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  # Create a public subnet within the VPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ]
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  # Attach Internet Gateway to the VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Route Table
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  # Route for Internet access
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate route table with the subnet
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # Create a new EC2 KeyPair
+  EC2KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${AWS::StackName}-KeyPair"
+      KeyType: rsa
+
+  # IAM Role for EC2 to access ECR, S3, and SSM
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "ec2.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: 
+        - !Ref EC2InstanceRole
+
+  # Security group for EC2 instance
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable SSH access and Docker build
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  # EC2 instance named 'docker'
+  DockerEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref EC2KeyPair
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: ami-02b49a24cfb95941c  # Amazon Linux 2 AMI (us-east-1)
+      Tags:
+        - Key: Name
+          Value: docker
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install -y docker
+          sudo yum install -y aws-cli
+          sudo yum install -y amazon-ssm-agent git
+          sudo service docker start
+          sudo usermod -a -G docker ec2-user
+          sudo systemctl enable amazon-ssm-agent
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${ECRRepositoryUrl}
+
+Outputs:
+  InstanceId:
+    Description: InstanceId of the newly created EC2 instance
+    Value: !Ref DockerEC2Instance
+
+  PublicIP:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt DockerEC2Instance.PublicIp
+
+  VPCId:
+    Description: ID of the VPC created by the stack
+    Value: !Ref VPC
+
+  SubnetId:
+    Description: ID of the public subnet created by the stack
+    Value: !Ref PublicSubnet
+
+  KeyPairName:
+    Description: Name of the newly created EC2 KeyPair
+    Value: !Ref EC2KeyPair
